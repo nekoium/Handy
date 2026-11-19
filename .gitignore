@@ -45,3 +45,9 @@ result
 
 # Python bytecode (scripts/)
 __pycache__/
+
+# Local Qwen preview backend, builds, models and portable data
+/.qwen-preview/
+*.gguf
+*.wav
+*.gguf.download

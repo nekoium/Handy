@@ -91,6 +91,14 @@ impl<'a> ChunkedDecode<'a> {
         decode.finish()
     }
 
+    /// Reuse the authoritative language decision once the first chunk resolved it.
+    pub(super) fn run_options(&self) -> Option<&transcribe_cpp::RunOptions> {
+        match &self.setup {
+            ChunkSetup::Ready(setup) => Some(&setup.run_options),
+            ChunkSetup::Pending(_) => None,
+        }
+    }
+
     /// Samples pushed so far.
     pub(super) fn samples(&self) -> usize {
         self.chunker.samples()

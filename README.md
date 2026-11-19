@@ -1,5 +1,7 @@
 # Handy
 
+**Experimental Qwen live preview fork:** see [setup and usage](QWEN-LIVE-PREVIEW.md). Preview is opt-in; this source branch uses unchanged pinned upstream inference and includes Windows build/launch scripts. Upstream Handy downloads below do not include this experiment.
+
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
 **A free, open source, and extensible speech-to-text application that works completely offline.**

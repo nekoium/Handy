@@ -1,7 +1,7 @@
 //! A recording's live decode: a stream the model decodes as audio arrives,
 //! or long-form chunks decoded as the recording goes.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use log::{debug, error, info};
@@ -9,12 +9,13 @@ use transcribe_cpp::StreamOptions;
 
 use super::chunked::{ChunkSetup, ChunkedDecode, PendingSetup};
 use super::policy::LiveDecode;
+use super::preview::{PreviewQueue, PreviewStatus};
 use super::{
     emit_stream_text, join_chunks, lock_perf, PreviewScript, RunOutcome, RunSetup,
     StreamFinalizeReply, StreamPerf, TranscriptionManager,
 };
 use crate::audio_toolkit::OutputLanguageEvidence;
-use crate::engine_supervisor::{EngineError, LoadedInfo, StreamHandle, StreamProgress};
+use crate::engine_supervisor::{CancelMark, EngineError, LoadedInfo, StreamHandle, StreamProgress};
 use crate::settings::{get_settings, AppSettings};
 
 /// One recording's live decode.
@@ -25,6 +26,8 @@ pub(super) struct LiveSession<'a> {
 enum LiveDecoder<'a> {
     /// With the run setup its result finishes with.
     Stream(StreamSession<'a>, Box<RunSetup>),
+    /// Display-only snapshots alongside normal final chunks.
+    Preview(Box<PreviewSession<'a>>),
     /// Its setup is resolved by its first chunk.
     Chunked(Box<ChunkedDecode<'a>>),
 }
@@ -41,6 +44,8 @@ impl<'a> LiveSession<'a> {
         mode: LiveDecode,
         info: &LoadedInfo,
         model_id: &str,
+        preview_status: Option<Arc<PreviewStatus>>,
+        mark: CancelMark,
     ) -> Option<Self> {
         if mode == LiveDecode::None {
             return None;
@@ -51,11 +56,41 @@ impl<'a> LiveSession<'a> {
         let plan = tm.language_plan(&settings, model_id, info);
         let decoder = match mode {
             LiveDecode::None => unreachable!("returned above"),
+            LiveDecode::Preview => {
+                let setup = tm.setup_for(info, &settings, &plan, &[]);
+                let preview_script = PreviewScript::new(
+                    settings.chinese_script,
+                    &setup.output_language(&settings, None),
+                );
+                let chunks = settings.long_form_chunking.then(|| {
+                    ChunkedDecode::new(
+                        tm,
+                        mark,
+                        ChunkSetup::Pending(Box::new(PendingSetup {
+                            plan,
+                            info: info.clone(),
+                            settings: settings.clone(),
+                        })),
+                        model_id,
+                        settings.vad_backend,
+                    )
+                });
+                tm.stream_active.store(true, Ordering::Release);
+                LiveDecoder::Preview(Box::new(PreviewSession {
+                    tm,
+                    mark,
+                    model_id: model_id.to_owned(),
+                    setup,
+                    preview_script,
+                    chunks,
+                    queue: PreviewQueue::with_status(preview_status?),
+                }))
+            }
             LiveDecode::Stream => {
                 // A stream's language is fixed before any audio, so it can't
                 // be detected; a detect plan falls back.
                 let setup = tm.setup_for(info, &settings, &plan, &[]);
-                let stream = StreamSession::begin(tm, info, &settings, &setup, model_id)?;
+                let stream = StreamSession::begin(tm, info, &settings, &setup, model_id, mark)?;
                 LiveDecoder::Stream(stream, Box::new(setup))
             }
             LiveDecode::Chunked => {
@@ -63,7 +98,7 @@ impl<'a> LiveSession<'a> {
                 let backend = settings.vad_backend;
                 LiveDecoder::Chunked(Box::new(ChunkedDecode::new(
                     tm,
-                    tm.engine.cancel_mark(),
+                    mark,
                     ChunkSetup::Pending(Box::new(PendingSetup {
                         plan,
                         info: info.clone(),
@@ -77,8 +112,9 @@ impl<'a> LiveSession<'a> {
         Some(Self { decoder })
     }
 
-    pub(super) fn feed(&mut self, pcm: Vec<f32>) {
+    pub(super) fn feed(&mut self, pcm: Vec<f32>, pending: Option<&AtomicUsize>) {
         match &mut self.decoder {
+            LiveDecoder::Preview(preview) => preview.feed(pcm, pending),
             LiveDecoder::Stream(stream, _) => stream.feed(pcm),
             LiveDecoder::Chunked(chunks) => chunks.push(pcm),
         }
@@ -97,7 +133,76 @@ impl<'a> LiveSession<'a> {
                         model_detected_language,
                     }))
             }
+            LiveDecoder::Preview(preview) => {
+                preview.queue.status.disable();
+                preview.tm.engine.check_cancelled(preview.mark)?;
+                match preview.chunks {
+                    Some(chunks) => finish_chunks(chunks, recorded_samples),
+                    None => Ok(None),
+                }
+            }
             LiveDecoder::Chunked(chunks) => finish_chunks(*chunks, recorded_samples),
+        }
+    }
+}
+
+struct PreviewSession<'a> {
+    tm: &'a TranscriptionManager,
+    mark: CancelMark,
+    model_id: String,
+    setup: RunSetup,
+    preview_script: PreviewScript,
+    chunks: Option<ChunkedDecode<'a>>,
+    queue: PreviewQueue,
+}
+
+impl PreviewSession<'_> {
+    fn feed(&mut self, pcm: Vec<f32>, pending: Option<&AtomicUsize>) {
+        // Authoritative work always gets the worker first, with its original audio/setup.
+        if let Some(chunks) = &mut self.chunks {
+            chunks.push(pcm.clone());
+            if chunks.failed() {
+                self.queue.status.disable();
+            }
+        }
+        let idle = pending.is_none_or(|pending| pending.load(Ordering::Acquire) == 0);
+        let Some(snapshot) = self.queue.push(&pcm, idle) else {
+            return;
+        };
+        let received = {
+            let active = self.queue.status.active();
+            if !*active {
+                return;
+            }
+            // Submission is serialized with stop; waiting never holds the guard.
+            self.tm.engine.queue_transcribe_since(
+                self.mark,
+                snapshot,
+                self.chunks
+                    .as_ref()
+                    .and_then(|chunks| chunks.run_options())
+                    .unwrap_or(&self.setup.run_options)
+                    .clone(),
+            )
+        };
+        let result =
+            received.and_then(|rx| rx.recv().unwrap_or_else(|_| Err(EngineError::Cancelled)));
+        let active = self.queue.status.active();
+        if !*active || self.tm.engine.check_cancelled(self.mark).is_err() {
+            return;
+        }
+        match result {
+            Ok(transcript) => {
+                let (_, tentative) = self.preview_script.convert("", &transcript.text);
+                emit_stream_text(&self.tm.app_handle, "", &tentative);
+            }
+            Err(e) => {
+                info!("Qwen batch preview stopped: {}", e);
+                drop(active);
+                self.queue.status.disable();
+                self.tm
+                    .forget_model_if_engine_dropped(&self.model_id, &e.to_string());
+            }
         }
     }
 }
@@ -159,12 +264,16 @@ impl<'a> StreamSession<'a> {
         settings: &AppSettings,
         setup: &RunSetup,
         model_id: &str,
+        mark: CancelMark,
     ) -> Option<Self> {
         let output_language = setup.output_language(settings, None);
 
         // Feed results arrive on the engine's thread; this callback only
         // converts and emits preview text.
         let perf = Arc::new(Mutex::new(StreamPerf::new()));
+        if tm.engine.check_cancelled(mark).is_err() {
+            return None;
+        }
         let on_progress = {
             let perf = Arc::clone(&perf);
             let app_handle = tm.app_handle.clone();
@@ -188,7 +297,8 @@ impl<'a> StreamSession<'a> {
         // result, and the caller falls back to batch transcription.
         // StreamOptions::default() uses CommitPolicy::Auto and lets the
         // family pick its own streaming strategy (no family-specific ext).
-        let stream = match tm.engine.start_stream(
+        let stream = match tm.engine.start_stream_since(
+            mark,
             setup.run_options.clone(),
             StreamOptions::default(),
             on_progress,

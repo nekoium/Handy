@@ -573,6 +573,7 @@ impl ShortcutAction for TranscribeAction {
         // Use the app-facing model capability as the single pre-recording source
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
+        let qwen_preview = tm.qwen_preview_candidate(&settings);
         let model_supports_streaming = selected_model_info
             .as_ref()
             .map(|m| m.supports_streaming)
@@ -587,8 +588,10 @@ impl ShortcutAction for TranscribeAction {
         // Before the model loads, whether it keeps its accuracy on long audio
         // is unknown, so assume not: the worker decides again with the loaded
         // model, and a wrong guess costs only an idle worker.
+        tm.begin_recording();
         let expected_model = ModelTraits {
-            streaming: model_supports_streaming,
+            // Display-only preview preserves Qwen's offline VAD policy above.
+            streaming: model_supports_streaming || qwen_preview,
             long_form: false,
         };
         if live_decode(expected_model, settings.long_form_chunking) != LiveDecode::None {
@@ -601,7 +604,9 @@ impl ShortcutAction for TranscribeAction {
         // pill instead of an oversized transparent live window.
         let overlay_started = Instant::now();
         match settings.overlay_style {
-            OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(app),
+            OverlayStyle::Live if model_supports_streaming || qwen_preview => {
+                utils::show_streaming_overlay(app)
+            }
             OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(app),
             OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
         }

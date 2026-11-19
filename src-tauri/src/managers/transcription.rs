@@ -27,7 +27,7 @@ use policy::{batch_decode, live_decode, BatchDecode, ModelTraits};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -39,6 +39,7 @@ mod chunked;
 mod job;
 mod live;
 pub mod policy;
+mod preview;
 
 pub use job::ChunkControl;
 
@@ -134,11 +135,14 @@ pub struct StreamRouter {
 }
 
 /// One streaming worker's command channel.
+#[derive(Clone)]
 struct Route {
     tx: mpsc::Sender<StreamCmd>,
     /// Set by `cancel_stream`, so the worker drops audio still queued ahead
     /// of the `Cancel` instead of decoding it.
     cancelled: Arc<AtomicBool>,
+    preview_pending: Option<Arc<AtomicUsize>>,
+    preview_status: Option<Arc<preview::PreviewStatus>>,
 }
 
 impl StreamRouter {
@@ -152,22 +156,33 @@ impl StreamRouter {
     /// Open a fresh command channel for a new streaming session, returning the
     /// receiver the worker should drain and its cancel flag. Caller must
     /// ensure no prior channel is still open.
-    fn open(&self) -> (mpsc::Receiver<StreamCmd>, Arc<AtomicBool>) {
+    fn open(&self, preview: bool) -> (mpsc::Receiver<StreamCmd>, Route) {
         let (tx, rx) = mpsc::channel::<StreamCmd>();
         let cancelled = Arc::new(AtomicBool::new(false));
-        *self.route.lock().unwrap() = Some(Route {
+        let preview_pending = preview.then(|| Arc::new(AtomicUsize::new(0)));
+        let preview_status = preview.then(|| Arc::new(preview::PreviewStatus::new()));
+        let route = Route {
             tx,
-            cancelled: Arc::clone(&cancelled),
-        });
+            cancelled,
+            preview_pending,
+            preview_status,
+        };
+        *self.route.lock().unwrap() = Some(route.clone());
         self.open.store(true, Ordering::Relaxed);
-        (rx, cancelled)
+        (rx, route)
     }
 
     /// Take the route out (closing the channel to new feeds), so the caller
     /// can send the final `Finalize`/`Cancel` command.
     fn take(&self) -> Option<Route> {
         self.open.store(false, Ordering::Relaxed);
-        self.route.lock().unwrap().take()
+        let route = self.route.lock().unwrap().take();
+        if let Some(route) = &route {
+            if let Some(status) = &route.preview_status {
+                status.disable();
+            }
+        }
+        route
     }
 
     /// Drop the channel and mark closed without sending a final command (used
@@ -184,7 +199,25 @@ impl StreamRouter {
             return;
         }
         if let Some(route) = self.route.lock().unwrap().as_ref() {
-            let _ = route.tx.send(StreamCmd::Feed(frame.to_vec()));
+            if let Some(pending) = &route.preview_pending {
+                let queued = pending.fetch_add(frame.len(), Ordering::AcqRel);
+                if route.preview_status.is_some()
+                    && frame.len() > (12 * 16_000_usize).saturating_sub(queued)
+                {
+                    pending.fetch_sub(frame.len(), Ordering::AcqRel);
+                    route.cancelled.store(true, Ordering::Release);
+                    if let Some(status) = &route.preview_status {
+                        status.disable();
+                    }
+                    self.open.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+            if route.tx.send(StreamCmd::Feed(frame.to_vec())).is_err() {
+                if let Some(pending) = &route.preview_pending {
+                    pending.fetch_sub(frame.len(), Ordering::AcqRel);
+                }
+            }
         }
     }
 
@@ -259,6 +292,7 @@ pub struct TranscriptionManager {
     /// [`StreamRouter`]. Shared with the audio recorder so per-frame feeds skip
     /// Tauri state and the manager lock.
     router: Arc<StreamRouter>,
+    recording_mark: Arc<Mutex<Option<CancelMark>>>,
     /// True only while a transcribe-cpp stream is actually in flight (set by
     /// the worker once the stream begins). Used for overlay/UI decisions.
     stream_active: Arc<AtomicBool>,
@@ -294,6 +328,7 @@ impl TranscriptionManager {
             loading_condvar: Arc::new(Condvar::new()),
             reload_model_on_next_use: Arc::new(AtomicBool::new(false)),
             router: Arc::new(StreamRouter::new()),
+            recording_mark: Arc::new(Mutex::new(None)),
             stream_active: Arc::new(AtomicBool::new(false)),
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
@@ -636,7 +671,7 @@ impl TranscriptionManager {
         let caps = &info.capabilities;
         self.model_manager.set_runtime_capabilities(
             model_id,
-            caps.supports_streaming,
+            ModelTraits::of(&info).streaming,
             caps.supports_translate,
             caps.supports_language_detect,
             caps.languages.clone(),
@@ -766,6 +801,18 @@ impl TranscriptionManager {
         }
     }
 
+    /// Unknown architecture gets a bounded candidate route; only loaded Qwen uses preview.
+    pub fn qwen_preview_candidate(&self, settings: &AppSettings) -> bool {
+        let loaded = (self.get_current_model().as_deref() == Some(&settings.selected_model))
+            .then(|| self.engine.loaded())
+            .flatten();
+        policy::qwen_preview_enabled(
+            policy::qwen_preview_requested(),
+            settings.overlay_style,
+            loaded.as_ref().map(|info| info.arch.as_str()),
+        )
+    }
+
     pub fn get_current_model(&self) -> Option<String> {
         let current_model = self.current_model_id.lock().unwrap();
         current_model.clone()
@@ -799,12 +846,29 @@ impl TranscriptionManager {
     /// Whether a live streaming run is currently in flight.
     pub fn is_streaming(&self) -> bool {
         self.stream_active.load(Ordering::Acquire)
+            && self
+                .router
+                .route
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|route| {
+                    route
+                        .preview_status
+                        .as_ref()
+                        .is_none_or(|status| *status.active())
+                })
     }
 
     /// Shared handle to the stream router, used by the audio recorder to feed
     /// real-time frames without going through Tauri state on every frame.
     pub fn stream_router(&self) -> Arc<StreamRouter> {
         Arc::clone(&self.router)
+    }
+
+    /// Start one recording's cancellation lifetime, including recordings without live decoding.
+    pub fn begin_recording(&self) {
+        *self.recording_mark.lock().unwrap() = Some(self.engine.cancel_mark());
     }
 
     /// Begin a recording's live decode on the held engine's session. Audio
@@ -832,19 +896,34 @@ impl TranscriptionManager {
             warn!("start_stream lost a race with another stream worker");
             return;
         }
-        let (rx, cancelled) = self.router.open();
+        let settings = get_settings(&self.app_handle);
+        let preview = self.qwen_preview_candidate(&settings);
+        let mark = self
+            .recording_mark
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| self.engine.cancel_mark());
+        let (rx, route) = self.router.open(preview);
         self.stream_active.store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, cancelled, worker_id));
+        thread::spawn(move || manager.run_stream_worker(rx, route, worker_id, mark));
     }
 
     fn run_stream_worker(
         &self,
         rx: mpsc::Receiver<StreamCmd>,
-        cancelled: Arc<AtomicBool>,
+        route: Route,
         worker_id: u64,
+        mark: CancelMark,
     ) {
+        let Route {
+            cancelled,
+            preview_pending,
+            preview_status,
+            tx,
+        } = route;
+        drop(tx);
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -860,6 +939,10 @@ impl TranscriptionManager {
             }
         }
 
+        if cancelled.load(Ordering::Acquire) || self.engine.check_cancelled(mark).is_err() {
+            drain_until_finalize(rx);
+            return;
+        }
         let model_id = self.get_current_model().unwrap_or_default();
 
         // The loaded model (not the ModelManager copy) is the source of truth
@@ -885,11 +968,29 @@ impl TranscriptionManager {
             caps.supports_translate,
             caps.languages,
         );
-        let mode = live_decode(
-            ModelTraits::of(&info),
-            get_settings(&self.app_handle).long_form_chunking,
-        );
-        let Some(mut session) = LiveSession::begin(self, mode, &info, &model_id) else {
+        let settings = get_settings(&self.app_handle);
+        let mode = if preview_status.is_some()
+            && policy::qwen_preview_enabled(
+                policy::qwen_preview_requested(),
+                settings.overlay_style,
+                Some(&info.arch),
+            ) {
+            policy::LiveDecode::Preview
+        } else {
+            live_decode(ModelTraits::of(&info), settings.long_form_chunking)
+        };
+        if mode != policy::LiveDecode::Preview {
+            let mut route = self.router.route.lock().unwrap();
+            if let Some(route) = route
+                .as_mut()
+                .filter(|route| Arc::ptr_eq(&route.cancelled, &cancelled))
+            {
+                route.preview_status = None;
+            }
+        }
+        let Some(mut session) =
+            LiveSession::begin(self, mode, &info, &model_id, preview_status, mark)
+        else {
             // Nothing to decode live: the recording is transcribed in batch.
             self.router.clear();
             drain_until_finalize(rx);
@@ -900,12 +1001,15 @@ impl TranscriptionManager {
         while let Ok(cmd) = rx.recv() {
             match cmd {
                 StreamCmd::Feed(pcm) => {
+                    if let Some(pending) = &preview_pending {
+                        pending.fetch_sub(pcm.len(), Ordering::AcqRel);
+                    }
                     // Audio queued ahead of a cancel is dropped, not decoded.
                     if cancelled.load(Ordering::Acquire) {
                         continue;
                     }
                     self.touch_activity();
-                    session.feed(pcm);
+                    session.feed(pcm, preview_pending.as_deref());
                 }
                 StreamCmd::Finalize { reply, samples } => {
                     let _ = reply.send(session.finish(samples));
@@ -933,6 +1037,7 @@ impl TranscriptionManager {
         let Some(route) = self.router.take() else {
             return Ok(None);
         };
+        self.stream_active.store(false, Ordering::Release);
         let (reply_tx, reply_rx) = mpsc::channel();
         let finalize = StreamCmd::Finalize {
             reply: reply_tx,
@@ -978,15 +1083,24 @@ impl TranscriptionManager {
     /// Transcribe a whole clip in batch: a re-transcribed history entry, or
     /// a file from the CLI.
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
-        Ok(self.complete(Instant::now(), audio, None)?.text)
+        Ok(self
+            .complete(Instant::now(), audio, None, self.engine.cancel_mark())?
+            .text)
     }
 
     /// Transcribe a finished recording: what its live decode produced, or a
     /// batch run of the whole recording when there is no live result.
     pub fn transcribe_recording(&self, samples: Vec<f32>) -> Result<Transcription> {
         let started = Instant::now();
+        let mark = self
+            .recording_mark
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| self.engine.cancel_mark());
         let live = self.finalize_live(samples.len())?;
-        self.complete(started, samples, live)
+        self.engine.check_cancelled(mark)?;
+        self.complete(started, samples, live, mark)
     }
 
     /// The final text of one transcription, from its live result or else a
@@ -996,6 +1110,7 @@ impl TranscriptionManager {
         started: Instant,
         audio: Vec<f32>,
         live: Option<RunOutcome>,
+        mark: CancelMark,
     ) -> Result<Transcription> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
@@ -1017,7 +1132,7 @@ impl TranscriptionManager {
 
         let outcome = match live {
             Some(outcome) => outcome,
-            None => self.decode_batch(audio)?,
+            None => self.decode_batch(mark, audio)?,
         };
         let settings = get_settings(&self.app_handle);
         let language = outcome
@@ -1060,10 +1175,8 @@ impl TranscriptionManager {
 
     /// Decode a whole clip with the loaded model, loading it first if a load
     /// is under way.
-    fn decode_batch(&self, audio: Vec<f32>) -> Result<RunOutcome> {
-        // A cancel from here on (during the model-load wait or chunk planning
-        // included) stops every run of this transcription.
-        let mark = self.engine.cancel_mark();
+    fn decode_batch(&self, mark: CancelMark, audio: Vec<f32>) -> Result<RunOutcome> {
+        self.engine.check_cancelled(mark)?;
         self.touch_activity();
         let batch = self.batch_context(&audio)?;
         self.transcribe_cpp(mark, batch, audio)
@@ -1109,7 +1222,7 @@ impl TranscriptionManager {
         crate::language_detection::plan_for(
             settings,
             model.as_ref(),
-            info.capabilities.supports_streaming,
+            ModelTraits::of(info).streaming,
         )
     }
 
@@ -2001,6 +2114,176 @@ pub fn get_available_accelerators(tm: &TranscriptionManager) -> AvailableAcceler
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_router_bounds_audio_while_model_is_loading() {
+        let router = StreamRouter::new();
+        let (
+            rx,
+            Route {
+                cancelled,
+                preview_pending: pending,
+                preview_status: status,
+                ..
+            },
+        ) = router.open(true);
+        let status = status.unwrap();
+        let pending = pending.unwrap();
+        router.feed(&vec![0.0; 12 * 16_000]);
+        assert_eq!(pending.load(Ordering::Acquire), 12 * 16_000);
+        router.feed(&[0.0]);
+        assert!(!router.is_open());
+        assert!(!*status.active());
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(pending.load(Ordering::Acquire), 12 * 16_000);
+        assert!(matches!(rx.try_recv(), Ok(StreamCmd::Feed(pcm)) if pcm.len() == 12 * 16_000));
+        assert!(rx.try_recv().is_err());
+        // The route is retained so stop can still receive the batch fallback reply.
+        assert!(router.take().is_some());
+    }
+
+    #[test]
+    fn disabled_preview_keeps_authoritative_route_storage_and_final_reply() {
+        let router = StreamRouter::new();
+        let (rx, route) = router.open(true);
+        route.preview_status.as_ref().unwrap().disable();
+        router.feed(&[0.0]);
+        assert!(router.is_open());
+        assert_eq!(
+            route
+                .preview_pending
+                .as_ref()
+                .unwrap()
+                .load(Ordering::Acquire),
+            1
+        );
+        assert!(matches!(rx.try_recv(), Ok(StreamCmd::Feed(pcm)) if pcm == [0.0]));
+        let route = router.take().unwrap();
+        assert!(!route.cancelled.load(Ordering::Acquire));
+        let (reply, answer) = mpsc::channel();
+        route
+            .tx
+            .send(StreamCmd::Finalize { reply, samples: 1 })
+            .unwrap();
+        drain_until_finalize(rx);
+        assert!(answer.recv().unwrap().unwrap().is_none());
+    }
+
+    #[test]
+    fn ordinary_stream_route_keeps_pending_audio_on_stop() {
+        let router = StreamRouter::new();
+        let (
+            rx,
+            Route {
+                cancelled,
+                preview_pending: pending,
+                preview_status: status,
+                ..
+            },
+        ) = router.open(false);
+        assert!(pending.is_none() && status.is_none());
+        router.feed(&[1.0]);
+        router.take().unwrap();
+        assert!(!cancelled.load(Ordering::Acquire));
+        assert!(matches!(rx.try_recv(), Ok(StreamCmd::Feed(pcm)) if pcm == [1.0]));
+    }
+
+    #[test]
+    fn route_stop_cancel_and_overflow_block_a_completed_feed_callback() {
+        for operation in ["stop", "cancel", "overflow"] {
+            let router = Arc::new(StreamRouter::new());
+            let (
+                rx,
+                Route {
+                    cancelled,
+                    preview_status: status,
+                    ..
+                },
+            ) = router.open(true);
+            let status = status.unwrap();
+            let (ready, held) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let emitted = Arc::new(AtomicUsize::new(0));
+            let callback_status = Arc::clone(&status);
+            let callback_emitted = Arc::clone(&emitted);
+            let callback = thread::spawn(move || {
+                // Native feed succeeded; hold immediately before the callback guard.
+                ready.send(()).unwrap();
+                released.recv().unwrap();
+                let active = callback_status.active();
+                if *active {
+                    callback_emitted.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            held.recv().unwrap();
+            router.feed(&[1.0]);
+            match operation {
+                "overflow" => router.feed(&vec![0.0; 12 * 16_000]),
+                "stop" | "cancel" => {
+                    let route = router.take().unwrap();
+                    if operation == "cancel" {
+                        route.cancelled.store(true, Ordering::Release);
+                        route.tx.send(StreamCmd::Cancel).unwrap();
+                    } else {
+                        let (reply, answer) = mpsc::channel();
+                        route
+                            .tx
+                            .send(StreamCmd::Finalize { reply, samples: 1 })
+                            .unwrap();
+                        let worker = thread::spawn(move || {
+                            // The production no-session drain must still deliver fallback.
+                            drain_until_finalize(rx);
+                        });
+                        assert!(answer.recv().unwrap().unwrap().is_none());
+                        worker.join().unwrap();
+                        release.send(()).unwrap();
+                        callback.join().unwrap();
+                        assert!(!cancelled.load(Ordering::Acquire));
+                        assert_eq!(emitted.load(Ordering::SeqCst), 0);
+                        continue;
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(cancelled.load(Ordering::Acquire));
+            assert!(!*status.active());
+            release.send(()).unwrap();
+            callback.join().unwrap();
+            assert_eq!(emitted.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn cancel_before_load_and_rapid_restart_keep_distinct_guards() {
+        let router = StreamRouter::new();
+        let (
+            old_rx,
+            Route {
+                cancelled,
+                preview_status: old_status,
+                ..
+            },
+        ) = router.open(true);
+        let old_status = old_status.unwrap();
+        router.feed(&[1.0]);
+        let old_route = router.take().unwrap();
+        old_route.cancelled.store(true, Ordering::Release);
+        old_route.tx.send(StreamCmd::Cancel).unwrap();
+        let (
+            _,
+            Route {
+                preview_status: new_status,
+                ..
+            },
+        ) = router.open(true);
+        let new_status = new_status.unwrap();
+        // Model readiness arrives after the old recording was cancelled.
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!*old_status.active());
+        drain_until_finalize(old_rx);
+        assert!(*new_status.active());
+        assert!(router.is_open());
+    }
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()

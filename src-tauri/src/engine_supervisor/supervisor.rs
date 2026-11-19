@@ -416,6 +416,15 @@ impl EngineSupervisor {
         CancelMark(self.shared.epoch())
     }
 
+    /// Reject work from an earlier cancellation epoch before planning or loading.
+    pub(crate) fn check_cancelled(&self, mark: CancelMark) -> Result<(), EngineError> {
+        if self.shared.cancelled_since(mark.0) {
+            Err(EngineError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     /// [`transcribe`](Self::transcribe), cancelled by any cancel since `mark`.
     pub fn transcribe_since(
         &self,
@@ -433,6 +442,26 @@ impl EngineSupervisor {
         .unwrap_or_else(|| Err(engine_stopped()))
     }
 
+    /// Submit on the existing serial queue; caller may release its emission guard before waiting.
+    pub(crate) fn queue_transcribe_since(
+        &self,
+        mark: CancelMark,
+        pcm: Vec<f32>,
+        run: RunOptions,
+    ) -> Result<mpsc::Receiver<Result<Transcript, EngineError>>, EngineError> {
+        self.check_cancelled(mark)?;
+        let (reply, received) = mpsc::channel();
+        self.commands
+            .send(Command::Transcribe {
+                pcm,
+                run,
+                epoch: mark.0,
+                reply,
+            })
+            .map_err(|_| engine_stopped())?;
+        Ok(received)
+    }
+
     /// Begin a live stream on the loaded model. `on_progress` runs on the
     /// owner thread after every feed, so it must not block or call back into
     /// the supervisor.
@@ -442,10 +471,18 @@ impl EngineSupervisor {
         stream: StreamOptions,
         on_progress: impl FnMut(StreamProgress) + Send + 'static,
     ) -> Result<StreamHandle, EngineError> {
+        self.start_stream_since(self.cancel_mark(), run, stream, on_progress)
+    }
+
+    pub(crate) fn start_stream_since(
+        &self,
+        mark: CancelMark,
+        run: RunOptions,
+        stream: StreamOptions,
+        on_progress: impl FnMut(StreamProgress) + Send + 'static,
+    ) -> Result<StreamHandle, EngineError> {
         let id = self.shared.next_id();
-        // The stream is one piece of cancellable work: a cancel from here on
-        // stops its feeds and its finalize.
-        let epoch = self.shared.epoch();
+        let epoch = mark.0;
         let closed = Arc::new(AtomicBool::new(false));
         self.ask(|reply| Command::StreamBegin {
             active: ActiveStream {
@@ -1513,6 +1550,177 @@ fn forward_worker_log(line: &str) {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    /// Exercise the real owner, cancellation checks and request framing without inference.
+    /// Only transport responses are scripted; the short-lived child supplies an OS handle.
+    fn scripted_worker() -> (Worker, mpsc::Sender<Response>, mpsc::Receiver<Vec<u8>>) {
+        #[cfg(windows)]
+        let child = ProcessCommand::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let child = ProcessCommand::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let (stdin, frames) = mpsc::channel();
+        let (replies, responses) = mpsc::channel();
+        let (_, stderr_done) = mpsc::channel();
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
+        let worker = Worker {
+            control: Arc::new(Control {
+                pid: child.id(),
+                child: Mutex::new(child),
+                stdin: Mutex::new(Some(stdin)),
+            }),
+            responses,
+            stderr_done,
+            stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
+            info: None,
+        };
+        (worker, replies, frames)
+    }
+
+    fn owner() -> Owner {
+        Owner {
+            shared: Arc::new(Shared::default()),
+            worker: None,
+            spec: None,
+            stream: None,
+            unloads_done: 0,
+            gpu_backend_error: false,
+        }
+    }
+
+    #[test]
+    fn recording_mark_survives_final_dispatch_barriers_and_between_chunks() {
+        for cancel_before_dispatch in [false, true] {
+            let mut owner = owner();
+            let mark = CancelMark(owner.shared.epoch());
+            let (commands, _) = mpsc::channel();
+            let engine = EngineSupervisor {
+                commands,
+                shared: Arc::clone(&owner.shared),
+            };
+            let (worker, replies, frames) = scripted_worker();
+            owner.worker = Some(worker);
+            if cancel_before_dispatch {
+                engine.cancel();
+                assert!(matches!(
+                    owner.transcribe(&[0.0], &RunOptions::default(), mark.0),
+                    Err(EngineError::Cancelled)
+                ));
+                assert!(frames.try_recv().is_err());
+            } else {
+                let (done, answer) = mpsc::channel();
+                let feeder = thread::spawn(move || {
+                    let result = owner.transcribe(&[0.0], &RunOptions::default(), mark.0);
+                    done.send((owner, result)).unwrap();
+                });
+                frames.recv().unwrap(); // final dispatch accepted; native response held
+                engine.cancel();
+                replies
+                    .send(Response::Transcript(Transcript::default()))
+                    .unwrap();
+                let (returned, result) = answer.recv().unwrap();
+                feeder.join().unwrap();
+                owner = returned;
+                assert!(matches!(result, Err(EngineError::Cancelled)));
+            }
+            assert!(matches!(
+                engine.check_cancelled(mark),
+                Err(EngineError::Cancelled)
+            ));
+            // Neither another authoritative chunk nor a late stream begin may acquire a fresh epoch.
+            assert!(matches!(
+                owner.transcribe(&[0.0], &RunOptions::default(), mark.0),
+                Err(EngineError::Cancelled)
+            ));
+            let closed = Arc::new(AtomicBool::new(false));
+            assert!(matches!(
+                owner.stream_begin(
+                    ActiveStream {
+                        id: 2,
+                        epoch: mark.0,
+                        closed,
+                        on_progress: Box::new(|_| {}),
+                        pending_ms: 0,
+                    },
+                    &RunOptions::default(),
+                    &StreamOptions::default()
+                ),
+                Err(EngineError::Cancelled)
+            ));
+            // History/file calls take their own current mark.
+            let independent = engine.cancel_mark();
+            assert!(engine.check_cancelled(independent).is_ok());
+            let (worker, replies, frames) = scripted_worker();
+            owner.worker = Some(worker);
+            replies
+                .send(Response::Transcript(Transcript::default()))
+                .unwrap();
+            assert!(owner
+                .transcribe(&[0.0], &RunOptions::default(), independent.0)
+                .is_ok());
+            assert_eq!(frames.try_iter().count(), 1);
+        }
+    }
+
+    #[test]
+    fn queued_batch_submission_preserves_cancel_epoch_without_waiting_for_inference() {
+        let shared = Arc::new(Shared::default());
+        let (commands, accepted) = mpsc::channel();
+        let engine = EngineSupervisor { commands, shared };
+        let mark = engine.cancel_mark();
+        let reply = engine
+            .queue_transcribe_since(mark, vec![0.0], RunOptions::default())
+            .unwrap();
+        let Command::Transcribe {
+            epoch,
+            reply: sender,
+            ..
+        } = accepted.recv().unwrap()
+        else {
+            panic!("expected ordinary batch command");
+        };
+        assert_eq!(epoch, mark.0);
+        assert!(reply.try_recv().is_err());
+        engine.cancel();
+        assert!(matches!(
+            engine.queue_transcribe_since(mark, vec![], RunOptions::default()),
+            Err(EngineError::Cancelled)
+        ));
+        assert!(accepted.try_recv().is_err());
+        sender.send(Err(EngineError::Cancelled)).unwrap();
+        assert!(matches!(reply.recv().unwrap(), Err(EngineError::Cancelled)));
+    }
+
+    #[test]
+    fn cancelled_mark_between_successful_final_chunks_dispatches_nothing_else() {
+        let mut owner = owner();
+        let (worker, replies, frames) = scripted_worker();
+        owner.worker = Some(worker);
+        let (commands, _) = mpsc::channel();
+        let engine = EngineSupervisor {
+            commands,
+            shared: Arc::clone(&owner.shared),
+        };
+        let mark = engine.cancel_mark();
+        replies
+            .send(Response::Transcript(Transcript::default()))
+            .unwrap();
+        assert!(owner
+            .transcribe(&[0.0], &RunOptions::default(), mark.0)
+            .is_ok());
+        assert_eq!(frames.try_iter().count(), 1);
+        engine.cancel();
+        assert!(matches!(
+            owner.transcribe(&[0.0], &RunOptions::default(), mark.0),
+            Err(EngineError::Cancelled)
+        ));
+        assert!(frames.try_recv().is_err());
+    }
 
     #[test]
     fn deadlines_scale_with_the_audio_above_a_floor() {
